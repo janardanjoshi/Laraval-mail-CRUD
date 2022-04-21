@@ -1,0 +1,289 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\TimeRecord;
+use App\Http\Requests\TimeRecordRequest;
+use Illuminate\Support\Facades\Auth;
+use App\User;
+use App\Imports\TimeRecordImport;
+use Maatwebsite\Excel\Facades\Excel;
+use Maatwebsite\Excel\ExcelServiceProvider;
+use App\TimeRecordTime;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Validator;
+
+class TimeRecordController extends Controller
+{
+    public function __construct()
+    {
+        $this->authorizeResource(TimeRecord::class);
+    }
+    
+    /**
+     * Display a listing of time records.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function index()
+    {
+        $selectCol = TimeRecord::ID . "," . TimeRecord::USER_ID . "," . TimeRecord::DATE . ", " . TimeRecord::IN_TIME . " as min_in_time, " . TimeRecord::OUT_TIME . " as max_out_time, " . TimeRecord::SPENT_TIME . " as total_spent_time, ". TimeRecord::STATUS;
+        $timeRecords = TimeRecord::selectRaw($selectCol)
+                ->with('user:' . User::ID . ',' . User::NAME)
+                ->where(TimeRecord::USER_ID, Auth::user()->id)
+                ->orderBy(TimeRecord::ID, 'DESC')->get();
+            
+        return view('time-records.index', compact('timeRecords'));
+    }
+
+    /**
+     * Show the form for creating a new time record.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function create()
+    {
+        $users = User::select(User::ID, User::NAME)->approved()->orderBy(User::NAME, 'ASC')->get();
+        
+        return view('time-records.add-edit', compact('users'));
+    }
+
+    /**
+     * Store a newly created resource in storage.
+     *
+     * @param  \App\Http\Requests\TimeRecordRequest  $request
+     * @return \Illuminate\Http\Response
+     */
+    public function store(TimeRecordRequest $request)
+    {
+        /* Calculate spent time difference between in-time and out-time */
+        $spentTime = strtotime($request->out_time) - strtotime($request->in_time);
+        $spentTime = date('H:i:s', $spentTime);
+        $request->merge([TimeRecord::SPENT_TIME => $spentTime]);
+        $request->merge([TimeRecord::STATUS => TimeRecord::timePeriodStatus($spentTime, $request->in_time, $request->date, $request->user_id )]);
+        
+        /* Change date formate */
+        $date = date('Y-m-d', strtotime($request->date));
+        $request->merge([TimeRecord::DATE => $date]);
+        /* Get data if user apply for same date */
+        $sameDateTimeRecordData = TimeRecord::where(TimeRecord::USER_ID, $request->user_id)
+                                            ->where(TimeRecord::DATE, $date)->first();
+        if($sameDateTimeRecordData){
+            if (!count($sameDateTimeRecordData->timeRecordTimes->toArray())) {
+                $getFirstEntryArray = [
+                    'in_time' => $sameDateTimeRecordData->in_time,
+                    'out_time' => $sameDateTimeRecordData->out_time,
+                    'spent_time' => $sameDateTimeRecordData->spent_time
+                ];
+                $sameDateTimeRecordData->timeRecordTimes()->create($getFirstEntryArray);
+            }
+            
+            /* Remove user-id and date from request data for insert time_record_time table */
+            $request->replace($request->except('user_id', 'date', 'status'));
+            $timeRecordTime = $sameDateTimeRecordData->timeRecordTimes()->create($request->all());
+            
+            $selectCol = "MIN(" . TimeRecordTime::IN_TIME . ") as min_in_time, MAX(" . TimeRecordTime::OUT_TIME . ") as max_out_time";
+            $timeRecords = TimeRecordTime::selectRaw($selectCol)
+                                        ->where(TimeRecordTime::TIME_RECORD_ID, $sameDateTimeRecordData["id"])    
+                                        ->groupBy(TimeRecordTime::TIME_RECORD_ID)
+                                        ->orderBy(TimeRecordTime::ID, 'DESC')->first();
+            $totalSpentTime = strtotime($timeRecords->max_out_time) - strtotime($timeRecords->min_in_time);
+            $totalSpentTime = date('H:i:s', $totalSpentTime);
+            
+            $sameDateTimeRecordData->{TimeRecord::IN_TIME} = $timeRecords->min_in_time;
+            $sameDateTimeRecordData->{TimeRecord::OUT_TIME} = $timeRecords->max_out_time;
+            $sameDateTimeRecordData->{TimeRecord::SPENT_TIME} = $totalSpentTime;
+            $sameDateTimeRecordData->{TimeRecord::STATUS} = TimeRecord::timePeriodStatus($totalSpentTime, $timeRecords->min_in_time, $request->date, $request->user_id );
+            $sameDateTimeRecordData->save();
+        }else{    
+            $sameDateTimeRecordData = TimeRecord::create($request->all());
+        }
+        
+        if ($sameDateTimeRecordData) {
+            if($sameDateTimeRecordData->user_id == Auth::user()->id) {
+                return redirect()->route('time-records.index')->with('success', __("Time record added successfully."));
+            }else{
+                return redirect()->route('time-records.team')->with('success', __("Time record added successfully."));
+            }
+        } else {
+            return redirect()->back()->withErrors(__("message.somethingwrong"))->withInput();
+        }
+    }
+
+    /**
+     * Display the specified resource.
+     *
+     * @param  \App\TimeRecord  $timeRecord
+     * @return \Illuminate\Http\Response
+     */
+    public function show(TimeRecord $timeRecord)
+    {
+        $timeRecord = $timeRecord->load('timeRecordTimes', 'user:' . User::ID . ',' . User::NAME);
+        
+        return view('time-records.view', compact('timeRecord'));
+    }
+
+    /**
+     * Show the form for editing the specified resource.
+     *
+     * @param  \App\TimeRecord  $timeRecord
+     * @return \Illuminate\Http\Response
+     */
+    public function edit(TimeRecord $timeRecord)
+    {
+        $users = User::select(User::ID, User::NAME)->approved()->orderBy(User::NAME, 'ASC')->get();
+        $timeRecord->load("timeRecordTimes");
+        
+        return view('time-records.add-edit', compact('timeRecord', 'users'));
+    }
+
+    /**
+     * Update the specified resource in storage.
+     *
+     * @param  \App\Http\Requests\TimeRecordRequest  $request
+     * @param  \App\TimeRecord  $timeRecord
+     * @return \Illuminate\Http\Response
+     */
+    public function update(TimeRecordRequest $request, TimeRecord $timeRecord)
+    {
+        if(isset($request->time)) {
+            foreach ($request->time as $key => $time){    
+                $spentTime = strtotime($time["out_time"]) - strtotime($time["in_time"]);
+                $spentTime = date('H:i:s', $spentTime);
+                $time['spent_time'] = $spentTime;
+                $timeRecord->timeRecordTimes()->where('id', $key)->update($time);
+            }
+
+            $timeRecord = $timeRecord->load('timeRecordTimes');
+            $minInTime = min(array_column($timeRecord->timeRecordTimes->toArray(), 'in_time'));
+            $maxOutTime = max(array_column($timeRecord->timeRecordTimes->toArray(), 'out_time'));
+
+            $spentTime = strtotime($maxOutTime) - strtotime($minInTime);
+            $spentTime = date('H:i:s', $spentTime);
+            $status = TimeRecord::timePeriodStatus($spentTime, $minInTime, $request->date, $request->user_id);
+            $date = date('Y-m-d', strtotime($request->date));
+
+            $timeRecord->{TimeRecord::IN_TIME} = $minInTime;
+            $timeRecord->{TimeRecord::OUT_TIME} = $maxOutTime;
+            $timeRecord->{TimeRecord::DATE} = $date;
+            $timeRecord->{TimeRecord::SPENT_TIME} = $spentTime;
+            $timeRecord->{TimeRecord::STATUS} = $status;
+            $timeRecord->save();
+        } else {
+            $spentTime = strtotime($request->out_time) - strtotime($request->in_time);
+            $spentTime = date('H:i:s', $spentTime);
+            $request->merge([TimeRecord::SPENT_TIME => $spentTime]);
+            $request->merge([TimeRecord::STATUS => TimeRecord::timePeriodStatus($spentTime, $request->in_time, $request->date, $request->user_id)]);
+            $request->merge([TimeRecord::DATE => date('Y-m-d', strtotime($request->date))]);
+            
+            $timeRecordUpdate = $timeRecord->update($request->all());
+        }
+        
+        if ($timeRecord) {
+            if($timeRecord->user_id == Auth::user()->id) {
+                return redirect()->route('time-records.index')->with('success', __("Time record updated successfully."));
+            }else{
+                return redirect()->route('time-records.team')->with('success', __("Time record updated successfully."));
+            }
+        } else {
+            return redirect()->back()->withErrors(__("message.somethingwrong"))->withInput();
+        }
+    }
+
+    /**
+     * Remove the specified resource from storage.
+     *
+     * @param  \App\TimeRecord  $timeRecord
+     * @return \Illuminate\Http\Response
+     */
+    public function destroy(TimeRecord $timeRecord)
+    {
+        $isDeleted = $timeRecord->delete();
+   
+        if ($isDeleted) {
+            return redirect()->back()->with('success', __("Time record deleted successfully."));
+        } else {
+            return redirect()->back()->withErrors(__("message.somethingwrong"))->withInput();
+        }
+    }
+    
+    /**
+     * Display a listing of the resource.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function teamTimeRecords()
+    {   
+        /* Check if user has access to browse time records. */
+        $this->authorize(config('constants.gate_keys.team_data'), TimeRecord::class);
+        
+        $selectCol = TimeRecord::ID . "," . TimeRecord::USER_ID . "," . TimeRecord::DATE . ", " . TimeRecord::IN_TIME . " as min_in_time, " . TimeRecord::OUT_TIME . " as max_out_time, " . TimeRecord::SPENT_TIME . " as total_spent_time, " . TimeRecord::STATUS;
+        $supervisors = User::getAllTeamMembers(Auth::user()->id);
+        $supervisorID = $supervisors->pluck(User::ID);
+        $timeRecords = TimeRecord::selectRaw($selectCol)
+                ->with('user:' . User::ID . ',' . User::NAME)
+                ->whereIn(TimeRecord::USER_ID, $supervisorID)
+                ->orderBy(TimeRecord::ID, 'DESC')
+                ->get();
+        
+        return view('time-records.team-index', compact('timeRecords'));
+         
+    }
+    
+    /**
+     * Display a listing of the resource.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function allTimeRecords()
+    {   
+        /* Check if user has access to browse time records. */
+        $this->authorize(config('constants.gate_keys.all_data'), TimeRecord::class);
+        
+        $selectCol = TimeRecord::ID . "," . TimeRecord::USER_ID . "," . TimeRecord::DATE . ", " . TimeRecord::IN_TIME . " as min_in_time, " . TimeRecord::OUT_TIME . " as max_out_time, " . TimeRecord::SPENT_TIME . " as total_spent_time, " . TimeRecord::STATUS;
+        $timeRecords = TimeRecord::selectRaw($selectCol)
+                ->with('user:' . User::ID . ',' . User::NAME)
+                ->orderBy(TimeRecord::ID, 'DESC')->get();
+        
+        return view('time-records.all-index', compact('timeRecords'));
+         
+    }
+    
+    /**
+     * Import time record data from excel file.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function timeRecordImport(Request $request)
+    {
+        /* Check if user has access to import time records. */
+        $this->authorize(config('constants.gate_keys.import'), TimeRecord::class);
+        
+        $request->validate([
+            'time_record_import' => 'required|mimes:csv,txt',   
+            'import_date' => 'required'
+        ]);
+        if ($request->hasFile('time_record_import')) {
+            $path = $request->file('time_record_import');
+            try {
+                Excel::import(new TimeRecordImport($request), $path);
+                return redirect()->back()->with('success', __('File imported successfully'));    
+            } catch (\Exception $e) {
+                return redirect()->back()->withErrors($e->getMessage())->withInput();
+            }
+        }
+    }
+    
+    /**
+     * Display a import time record file form.
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function timeRecordImportForm()
+    {
+        /* Check if user has access to import time records. */
+        $this->authorize(config('constants.gate_keys.import'), TimeRecord::class);
+        
+        return view('time-records.import_excel');
+    }
+}

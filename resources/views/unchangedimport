@@ -1,0 +1,243 @@
+<?php
+
+namespace App\Imports;
+
+use App\TimeRecord;
+use App\User;
+use Maatwebsite\Excel\Concerns\ToArray;
+use Maatwebsite\Excel\Concerns\WithHeadingRow;
+use Auth;
+
+class TimeRecordImport implements ToArray, WithHeadingRow
+{
+    protected $request;
+    
+    /**
+     * Constructor of Import class
+     * 
+     * @param \Illuminate\Http\Request $request
+     * @param \App\Import $import
+     */
+    public function __construct($request, $import = null)
+    {
+        $this->request = $request;
+        $this->import = $import;
+    }
+    
+    /**
+     * @param array $array
+     */
+    public function array(array $rows)
+    {
+        if($this->parseDate(trim($rows[0]['date'])) != $this->parseDate($this->request->import_date)) {
+            $this->excelError(__('Enter date and file date not match.'));
+        }
+
+        $excelKeys = array_keys($rows[0]);
+        $keys = ['empid', 'empname', 'date', 'totalhours'];
+        /* If invalid format is provided in excel */
+        if (count(array_diff($keys, $excelKeys)) > 0) {
+            return $this->excelError(__('Invalid excel format'));
+        }
+        /* Set array to collect all data from file */ 
+        $timeRecordCSVFileDatas = [];
+        /* Get all users employee id's */ 
+        $users = User::select(User::ID, User::EMPLOYEE_ID)->get()->toArray();
+        $allUserIDs = array_column($users, 'id');
+        $punchUserIDs = [];            
+        foreach ($rows as $key => $row) {
+            if (!empty(array_filter($row)) && !empty($row['empid'])) {
+                /* Check if employee id not found in user table */
+                if(!in_array($row['empid'], array_column($users, 'employee_id'))) {
+                    $this->excelError(__('Employee id not found.'));
+                }
+                /* get user_id from Emp_id array with emp_id */
+                $userKey = array_search($row['empid'], array_column($users, 'employee_id'));
+                $userId = $users[$userKey]['id'];
+                $punchUserIDs[] = $userId;
+
+                $timeRecordTimeData = [];
+                $punchCount = 1;
+                $punchInCount = 1;
+                $punchOutCount = 2;
+                $timeRecordTimeData[TimeRecord::USER_ID] = $userId;
+
+                $timeRecordDate = $this->filterData($row['date']);
+                $timeRecordTimeData[TimeRecord::DATE] = $this->parseDate($timeRecordDate);
+                $inOutKeys = 0;
+                foreach ($row as $trKeys => $value) {
+                    if ($trKeys == $punchCount.'_punch') {
+                        $time = $this->filterData($value);
+                        if ($trKeys == $punchInCount.'_punch' && $time) {
+                            $timeRecordTimeData['time'][$inOutKeys][TimeRecord::IN_TIME] = $time;
+                            $punchInCount += 2;
+                        } elseif ($trKeys == $punchOutCount.'_punch' && $time) {
+                            $timeRecordTimeData['time'][$inOutKeys][TimeRecord::OUT_TIME] = $time;
+                            $punchOutCount += 2;
+                            $inOutKeys++;
+                        }
+                        $punchCount++;
+                    }
+                }
+
+                $timeRecordTotalHours = $this->filterData($row['totalhours']);
+                $timeRecordTimeData[TimeRecord::SPENT_TIME] = $timeRecordTotalHours;
+
+                $timeRecordCSVFileDatas[] = $timeRecordTimeData;
+            }
+        }
+        
+        /* Data insert and update from time-record table */
+        if(count($timeRecordCSVFileDatas) > 0) {
+            $date = date('Y-m-d', strtotime($this->request->import_date));
+            /* Get all data of appliy date */
+            $timeRecordSameDateData = TimeRecord::where(TimeRecord::DATE, $date)->get();
+            $timeRecordToArray = $timeRecordSameDateData->toArray();
+            
+                /* Default entry for which user not punchh. */
+                $notPunchUserIDs = array_diff($allUserIDs, $punchUserIDs);
+                if($notPunchUserIDs) {
+                    $existUserIDs = $timeRecordSameDateData->pluck(TimeRecord::USER_ID)->toArray();
+                    $timeRecordData = [];
+                    $count = 0;
+                    foreach($notPunchUserIDs as $key => $notPunchUserID) {
+                        /* User time-record data not found in punch machine and time-record existing data. */
+                        if(!in_array($notPunchUserID, $existUserIDs)) {
+                            $timeRecordData[$count][TimeRecord::USER_ID] = $notPunchUserID;
+                            $timeRecordData[$count][TimeRecord::DATE] = $this->parseDate($this->request->import_date);
+                            $timeRecordData[$count][TimeRecord::IN_TIME] = "00:00:00";
+                            $timeRecordData[$count][TimeRecord::OUT_TIME] = "00:00:00";
+                            $timeRecordData[$count][TimeRecord::SPENT_TIME] = "00:00:00";
+                            $timeRecordData[$count][TimeRecord::STATUS] = TimeRecord::TIME_PERIOD_ABSENT;
+                        
+                            $count++;
+                        }
+                    }
+                    if($timeRecordData) {
+                        $timeRecord = new TimeRecord();
+                        $timeRecord = $timeRecord->insert($timeRecordData);
+                    }
+
+                }
+                
+            foreach ($timeRecordCSVFileDatas as $value) {
+                $userID = $value['user_id'];
+                /* get user_id from Emp_id array with emp_id */
+                $objectKey = array_search($userID, array_column($timeRecordToArray, 'user_id'));
+                if (is_numeric($objectKey)) {
+                    $timeRecord = $timeRecordSameDateData[$objectKey]->load('timeRecordTimes');
+                    if (count($value['time']) == 1) {
+                        if (count($timeRecord->timeRecordTimes->toArray())) {
+                            $timeRecord->timeRecordTimes()->delete();
+                        }
+                        $timeRecord->{TimeRecord::IN_TIME} = $value['time'][0]['in_time'];
+                        $timeRecord->{TimeRecord::OUT_TIME} = isset($value['time'][0]['out_time']) ? $value['time'][0]['out_time'] : NULL;
+                        $outTime = isset($value['time'][0]['out_time']) ? $value['time'][0]['out_time'] : $value['time'][0]['in_time'];
+                        $spentTime = strtotime($outTime) - strtotime($value['time'][0]['in_time']);
+                        $spentTime = date('H:i:s', $spentTime);
+                        $timeRecord->{TimeRecord::SPENT_TIME} = $spentTime;
+                        $timeRecord->{TimeRecord::STATUS} = TimeRecord::timePeriodStatus($spentTime, $value['time'][0]['in_time'], $date, $value['user_id']);
+                        $timeRecord->save();
+                    } else {
+                        $databaseTimeDataCount = $timeRecord->timeRecordTimes->count();
+                        $fileTimeDataCount = count($value['time']);
+                        $fileTime = $value['time'];
+                        $addTimeData = [];
+                        
+                        /* Process sheet in out time to add/update. */
+                        for ($i = 0; $i < $fileTimeDataCount; $i++) {
+                            $outTimes = isset($fileTime[$i]['out_time']) ? $fileTime[$i]['out_time'] : $fileTime[$i]['in_time'];
+                            $spentTime = strtotime($outTimes) - strtotime($fileTime[$i]['in_time']);
+                            $fileTime[$i]['spent_time'] = date('H:i:s', $spentTime);
+                            
+                            if (!isset($fileTime[$i]['out_time'])) {
+                                $fileTime[$i]['out_time'] = '00:00:00';
+                            }
+
+                            /* If database records exists then update them else create new one. */
+                            if ($i < $databaseTimeDataCount) {
+                                $timeRecord->timeRecordTimes[$i]->update($fileTime[$i]);
+                            } else {
+                                $addTimeData[] = $fileTime[$i];
+                            }
+                        }
+                        
+                        /* Add extra in out data in database. */
+                        if ($addTimeData) {
+                            $timeRecord->timeRecordTimes()->createMany($addTimeData);
+                        }
+                        
+                        /* Delete extra in out records from database. */
+                        for ($j = $i; $j < $databaseTimeDataCount; $j++) {
+                            $deleteData = $timeRecord->timeRecordTimes[$j];
+                            $deleteData->delete();
+                        }
+                        
+                        $minInTime = min(array_column($fileTime, 'in_time'));
+                        $maxOutTime = max(array_column($fileTime, 'out_time'));
+                        $maxOutTimeCheck = empty($maxOutTime) ? $minInTime : $maxOutTime;
+                        $spentTime = strtotime($maxOutTimeCheck) - strtotime($minInTime);
+                        $spentTime = date('H:i:s', $spentTime);
+                        $timeRecord->{TimeRecord::IN_TIME} = $minInTime;
+                        $timeRecord->{TimeRecord::OUT_TIME} = $maxOutTime;
+                        $timeRecord->{TimeRecord::SPENT_TIME} = $spentTime;
+                        $timeRecord->{TimeRecord::STATUS} = TimeRecord::timePeriodStatus($spentTime, $value['time'][0]['in_time'], $date, $value['user_id']);
+                        $timeRecord->save();
+                    }
+                } else {
+                    $timeRecord = new TimeRecord();
+                    $timeRecord->{TimeRecord::USER_ID} = $value['user_id'];
+                    $timeRecord->{TimeRecord::DATE} = $date;
+                    $timeRecord->{TimeRecord::IN_TIME} = $value['time'][0]['in_time'];
+                    $timeRecord->{TimeRecord::OUT_TIME} = isset($value['time'][0]['out_time']) ? $value['time'][0]['out_time'] : NULL;
+                    $outTime = isset($value['time'][0]['out_time']) ? $value['time'][0]['out_time'] : $value['time'][0]['in_time'];
+                    $spentTime = strtotime($outTime) - strtotime($value['time'][0]['in_time']);
+                    $spentTime = date('H:i:s', $spentTime);
+                    $timeRecord->{TimeRecord::SPENT_TIME} = $spentTime;
+                    $timeRecord->{TimeRecord::STATUS} = TimeRecord::timePeriodStatus($spentTime, $value['time'][0]['in_time'], $date, $value['user_id']);
+                    $timeRecord->save();
+                    if (count($value['time']) > 1) {
+                        $dataInsertInTimeRecordTime = [];
+                        /* Data insert in TimeRcordTime table */
+                        foreach ($value['time'] as $key => $time) {
+                            $outTime = isset($time['out_time']) ? strtotime($time['out_time']) : strtotime($time['in_time']);
+                            $spentTime = $outTime - strtotime($time['in_time']);
+                            $time['spent_time'] = date('H:i:s', $spentTime);
+                            $dataInsertInTimeRecordTime[] = $time;
+                        }
+                        $timeRecord->timeRecordTimes()->createMany($dataInsertInTimeRecordTime);
+                        
+                        $timeRecordTimes = $timeRecord->timeRecordTimes->toArray();
+                        $minInTime = min(array_column($timeRecordTimes, 'in_time'));
+                        $maxOutTime = max(array_column($timeRecordTimes, 'out_time'));
+                        $maxOutTimeCheck = empty($maxOutTime) ? $minInTime : $maxOutTime;
+                        $spentTime = strtotime($maxOutTimeCheck) - strtotime($minInTime);
+                        $spentTime = date('H:i:s', $spentTime);
+                        $timeRecord->{TimeRecord::IN_TIME} = $minInTime;
+                        $timeRecord->{TimeRecord::OUT_TIME} = $maxOutTime;
+                        $timeRecord->{TimeRecord::SPENT_TIME} = $spentTime;
+                        $timeRecord->{TimeRecord::STATUS} = TimeRecord::timePeriodStatus($spentTime, $value['time'][0]['in_time'], $date, $value['user_id']);
+						$timeRecord->save();
+                    }
+                }
+            }
+        }
+    }
+    
+    private function filterData($data)
+    {
+        $data = trim($data);
+        
+        return !empty($data) ? $data : (is_numeric($data) ? $data : NULL);
+    }
+    
+    private function parseDate($date)
+    {
+        return $date ? date('Y-m-d', strtotime($date)) : NULL;
+    }
+    
+    private function excelError($message)
+    {
+        throw new \Exception($message);
+    }
+}
